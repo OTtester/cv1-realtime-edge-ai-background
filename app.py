@@ -157,9 +157,11 @@ class Controls:
         cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window, 360, 220)
         # Trackbars
-        cv2.createTrackbar("Canny Low", self.window, 75, 255, lambda v: None)
+        # Set more sensitive defaults for edge detection and blur
+        cv2.createTrackbar("Canny Low", self.window, 50, 255, lambda v: None)
         cv2.createTrackbar("Canny High", self.window, 150, 255, lambda v: None)
-        cv2.createTrackbar("Blur (0..10)", self.window, 2, 10, lambda v: None)  # maps to odd 1..21
+        # Start with a smaller blur kernel (slider value maps to odd kernel size)
+        cv2.createTrackbar("Blur (0..10)", self.window, 1, 10, lambda v: None)
         cv2.createTrackbar("Mask Thresh", self.window, 128, 255, lambda v: None)
 
     def read(self):
@@ -237,6 +239,12 @@ def run(camera_index: int, target_width: int, bg_dir: str, start_bg: str = None)
         last_fps_time = time.time()
         frame_count = 0
         fps = 0.0
+        # Initialize variables for temporal smoothing of the segmentation mask and morphology operations
+        mask_accum = None
+        # A smoothing factor between 0 and 1; lower values produce smoother, more stable masks
+        smooth_alpha = 0.5
+        # Kernel used for morphological closing/opening to clean up the segmentation mask
+        kernel = np.ones((5, 5), np.uint8)
 
         while True:
             ok, frame = cap.read()
@@ -267,8 +275,19 @@ def run(camera_index: int, target_width: int, bg_dir: str, start_bg: str = None)
             gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
             edges = canny_edges(gray, blur_k=blur_k, lo=lo, hi=hi)
 
-            # Phase 3: AI segmentation (binary mask)
-            person_mask = segmenter.mask(frame_resized, thresh=mask_thresh)  # uint8 0/255
+            # Phase 3: AI segmentation (binary mask) with temporal smoothing and morphology
+            raw_mask = segmenter.mask(frame_resized, thresh=mask_thresh).astype(np.uint8)
+            # Initialize the accumulator on the first iteration
+            if mask_accum is None:
+                mask_accum = raw_mask.astype("float32")
+            # Smooth the mask over time using exponential moving average
+            cv2.accumulateWeighted(raw_mask, mask_accum, smooth_alpha)
+            smoothed_mask = cv2.convertScaleAbs(mask_accum)
+            # Apply the threshold from the trackbar to produce a binary person mask
+            _, person_mask = cv2.threshold(smoothed_mask, int(mask_thresh * 255), 255, cv2.THRESH_BINARY)
+            # Morphological cleaning to remove specks and fill holes
+            person_mask = cv2.morphologyEx(person_mask, cv2.MORPH_CLOSE, kernel)
+            person_mask = cv2.morphologyEx(person_mask, cv2.MORPH_OPEN, kernel)
             inv_mask = cv2.bitwise_not(person_mask)
 
             # Phase 4: Apply edges only on person; keep background clean
